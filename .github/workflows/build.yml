@@ -1,0 +1,138 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ohook-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WINLIBS_VER: 11.4.0-11.0.0-ucrt-r1
+  WINLIBS32: winlibs-i686-posix-dwarf-gcc-11.4.0-mingw-w64ucrt-11.0.0-r1.7z
+  WINLIBS64: winlibs-x86_64-posix-seh-gcc-11.4.0-mingw-w64ucrt-11.0.0-r1.7z
+  BUILD_TIME: "2023-08-07 12:00:00"
+  SHA256_SPPC32: 09865ea5993215965e8f27a74b8a41d15fd0f60f5f404cb7a8b3c7757acdab02
+  SHA256_SPPC64: 393a1fa26deb3663854e41f2b687c188a9eacd87b23f17ea09422c4715cb5a9f
+  EXPECTED_PE_TS: "64D0DCC0"
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Cache WinLibs toolchains
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:\tc
+          key: winlibs-${{ env.WINLIBS_VER }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Download WinLibs toolchains
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\tc | Out-Null
+          $base = "https://github.com/brechtsanders/winlibs_mingw/releases/download/$env:WINLIBS_VER"
+          foreach ($f in @($env:WINLIBS32, $env:WINLIBS64)) {
+            if (-not (Test-Path "C:\tc\$f")) { curl.exe -fsSL -o "C:\tc\$f" "$base/$f" }
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $f" }
+          }
+
+      - name: Extract toolchains to C:\mingw32 and C:\mingw64
+        shell: powershell
+        run: |
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) { $sevenZip = '7z.exe' }
+          $map = @(
+            @{ Archive = "C:\tc\$env:WINLIBS32"; Tmp = 'C:\tc\ext32'; Dest = 'C:\mingw32' },
+            @{ Archive = "C:\tc\$env:WINLIBS64"; Tmp = 'C:\tc\ext64'; Dest = 'C:\mingw64' }
+          )
+          foreach ($m in $map) {
+            Remove-Item $m.Tmp, $m.Dest -Recurse -Force -ErrorAction SilentlyContinue
+            & $sevenZip x $m.Archive "-o$($m.Tmp)" -y | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "7z extraction failed: $($m.Archive)" }
+            $gcc = Get-ChildItem $m.Tmp -Recurse -Filter gcc.exe | Where-Object { $_.Directory.Name -eq 'bin' } | Select-Object -First 1
+            if (-not $gcc) { throw "gcc.exe not found in $($m.Archive)" }
+            Move-Item $gcc.Directory.Parent.FullName $m.Dest
+          }
+          foreach ($g in 'C:\mingw32\bin\gcc.exe', 'C:\mingw64\bin\gcc.exe') {
+            if (-not (Test-Path $g)) { throw "missing $g" }
+          }
+
+      - name: Build with clock pinned to 2023-08-07 12:00 UTC
+        shell: powershell
+        run: |
+          Set-TimeZone -Id 'UTC'
+          $env:PATH = 'C:\mingw64\bin;C:\mingw32\bin;' + $env:PATH
+          $target = [datetime]::ParseExact($env:BUILD_TIME, 'yyyy-MM-dd HH:mm:ss', $null)
+          $clock = Start-Job -ScriptBlock {
+            param($d)
+            while ($true) { Set-Date -Date $d | Out-Null; Start-Sleep -Milliseconds 10 }
+          } -ArgumentList $target
+          Start-Sleep -Seconds 2
+          & C:\mingw64\bin\mingw32-make.exe sppc32.dll sppc64.dll
+          $code = $LASTEXITCODE
+          Stop-Job $clock -ErrorAction SilentlyContinue
+          Remove-Job $clock -Force -ErrorAction SilentlyContinue
+          if ($code -ne 0) { exit $code }
+          Get-ChildItem sppc32.dll, sppc64.dll | Select-Object Name, Length
+
+      - name: Verify checksums and PE timestamps
+        shell: powershell
+        run: |
+          $expected = @{
+            'sppc32.dll' = $env:SHA256_SPPC32
+            'sppc64.dll' = $env:SHA256_SPPC64
+          }
+          $failed = $false
+          foreach ($name in $expected.Keys) {
+            $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+            $ts = [BitConverter]::ToUInt32([IO.File]::ReadAllBytes($name), 0x88).ToString('X8')
+            Write-Host "$name sha256=$hash peTs=0x$ts"
+            if ($hash -ne $expected[$name]) {
+              Write-Host "::error::$name hash mismatch (expected $($expected[$name]))"
+              $failed = $true
+            }
+            if ($ts -ne $env:EXPECTED_PE_TS) {
+              Write-Host "::error::$name PE timestamp mismatch (expected 0x$($env:EXPECTED_PE_TS))"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Upload sppc32.dll
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sppc32
+          path: sppc32.dll
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload sppc64.dll
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sppc64
+          path: sppc64.dll
+          archive: false
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = 'sppc32.dll', 'sppc64.dll'
+          gh release view $env:GITHUB_REF_NAME *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:GITHUB_REF_NAME @assets --clobber
+          } else {
+            gh release create $env:GITHUB_REF_NAME @assets --title $env:GITHUB_REF_NAME `
+              --notes 'Built from ohook source; sppc32/sppc64 SHA-256 verified against MAS-published values.' --verify-tag
+          }
